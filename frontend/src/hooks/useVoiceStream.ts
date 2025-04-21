@@ -24,7 +24,7 @@ export const useVoiceStream = ({
 
   const connect = () => {
     try {
-      const ws = new WebSocket('ws://localhost:3000');
+      const ws = new WebSocket('ws://localhost:3000/ws/voice');
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -75,6 +75,11 @@ export const useVoiceStream = ({
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
+      // Send a message to notify server we're starting recording
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'start-recording' }));
+      }
+
       processor.onaudioprocess = (e) => {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           const inputData = e.inputBuffer.getChannelData(0);
@@ -85,7 +90,17 @@ export const useVoiceStream = ({
             pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
           }
           
-          wsRef.current.send(pcmData.buffer);
+          // Create a simple blob instead of sending the raw buffer
+          const blob = new Blob([pcmData.buffer], { type: 'audio/raw' });
+          const reader = new FileReader();
+          
+          reader.onload = () => {
+            if (reader.result instanceof ArrayBuffer && wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(reader.result);
+            }
+          };
+          
+          reader.readAsArrayBuffer(blob);
         }
       };
 
@@ -99,6 +114,11 @@ export const useVoiceStream = ({
   };
 
   const stopRecording = () => {
+    // Send stop recording message if connected
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'stop-recording' }));
+    }
+    
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;

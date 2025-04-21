@@ -1,47 +1,93 @@
-import React, { useEffect } from 'react';
+import { useState, useEffect } from 'react';
 
 interface AssistantResponseProps {
   message: string;
   role: 'user' | 'assistant';
   timestamp?: string;
+  isTyping?: boolean;
 }
 
-export function AssistantResponse({ message, role, timestamp }: AssistantResponseProps) {
-  const isUser = role === 'user';
+// Simple function to format relative time
+function formatRelativeTime(date: Date): string {
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffSec = Math.round(diffMs / 1000);
+  const diffMin = Math.round(diffSec / 60);
+  const diffHour = Math.round(diffMin / 60);
   
-  // Debug render
+  if (diffSec < 60) {
+    return 'just now';
+  } else if (diffMin < 60) {
+    return `${diffMin} minute${diffMin > 1 ? 's' : ''} ago`;
+  } else if (diffHour < 24) {
+    return `${diffHour} hour${diffHour > 1 ? 's' : ''} ago`;
+  } else {
+    return date.toLocaleDateString();
+  }
+}
+
+export function AssistantResponse({ 
+  message, 
+  role, 
+  timestamp, 
+  isTyping = false 
+}: AssistantResponseProps) {
+  const [formattedTime, setFormattedTime] = useState<string>('');
+  const [showFullTimestamp, setShowFullTimestamp] = useState(false);
+  
+  // Format the timestamp
   useEffect(() => {
-    console.log('Rendering message:', { message, role, timestamp });
-  }, [message, role, timestamp]);
-  
-  // Format the timestamp or use current time
-  const formattedTime = timestamp 
-    ? new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  
+    if (timestamp) {
+      try {
+        const date = new Date(timestamp);
+        setFormattedTime(formatRelativeTime(date));
+      } catch (error) {
+        console.error('Error formatting timestamp:', error);
+        setFormattedTime('');
+      }
+    }
+  }, [timestamp]);
+
+  // Toggle timestamp format
+  const toggleTimestampFormat = () => {
+    setShowFullTimestamp(!showFullTimestamp);
+  };
+
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-2`}>
-      {!isUser && (
-        <div className="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center text-white mr-2 flex-shrink-0">
+    <div className={`flex ${role === 'user' ? 'justify-end' : 'justify-start'} mb-4`}>
+      {role === 'assistant' && (
+        <div className="w-8 h-8 rounded-full bg-primary text-white flex items-center justify-center mr-2">
           AI
         </div>
       )}
       
-      <div 
-        className={`max-w-[80%] rounded-lg p-4 ${
-          isUser 
-            ? 'bg-primary text-primary-foreground rounded-tr-none' 
-            : 'bg-muted text-muted-foreground rounded-tl-none'
-        }`}
-      >
-        <p className="whitespace-pre-wrap break-words">{message}</p>
-        <span className="text-xs mt-1 opacity-70 block text-right">
-          {formattedTime}
-        </span>
+      <div className="flex flex-col">
+        <div className={`message-bubble ${role} ${isTyping ? 'is-typing' : ''}`}>
+          {isTyping ? (
+            <div className="typing-animation">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+          ) : (
+            <div>{message}</div>
+          )}
+        </div>
+        
+        {timestamp && (
+          <span 
+            className="text-xs text-gray-500 mt-1 cursor-pointer" 
+            onClick={toggleTimestampFormat}
+          >
+            {showFullTimestamp 
+              ? new Date(timestamp).toLocaleString() 
+              : formattedTime}
+          </span>
+        )}
       </div>
       
-      {isUser && (
-        <div className="w-8 h-8 rounded-full bg-gray-500 flex items-center justify-center text-white ml-2 flex-shrink-0">
+      {role === 'user' && (
+        <div className="w-8 h-8 rounded-full bg-gray-400 text-white flex items-center justify-center ml-2">
           You
         </div>
       )}

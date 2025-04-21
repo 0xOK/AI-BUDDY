@@ -15,6 +15,7 @@ interface UseWebSocketOptions {
   autoReconnect?: boolean;
   reconnectInterval?: number;
   maxReconnectAttempts?: number;
+  mockMode?: boolean;
 }
 
 interface WebSocketConnectionOptions {
@@ -28,10 +29,16 @@ interface WebSocketConnectionOptions {
   onError?: (error: Event) => void;
 }
 
-export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting' | 'failed';
+export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting' | 'failed' | 'mock';
+
+// Default URL detection - works both in dev and production
+function getDefaultWebSocketUrl(path: string = '/ws/voice'): string {
+  // For development, directly use port 3000
+  return `ws://localhost:3000${path}`;
+}
 
 export function useWebSocketConnection({
-  url = import.meta.env.VITE_WEBSOCKET_URL || 'ws://localhost:3000/ws',
+  url = import.meta.env.VITE_WEBSOCKET_URL || getDefaultWebSocketUrl(),
   onMessage,
   onAudio,
   onOpen,
@@ -39,16 +46,28 @@ export function useWebSocketConnection({
   onError,
   autoReconnect = true,
   reconnectInterval = 5000,
-  maxReconnectAttempts = 5
+  maxReconnectAttempts = 5,
+  mockMode = false
 }: UseWebSocketOptions) {
   const [isConnected, setIsConnected] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'failed'>('disconnected');
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectCountRef = useRef(0);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const isMockModeRef = useRef(mockMode);
+  const wsUrlRef = useRef(url);
 
   // Connect to the WebSocket server
   const connect = useCallback(() => {
+    // If mock mode is enabled, don't attempt to connect
+    if (isMockModeRef.current) {
+      console.log('WebSocket in mock mode - not connecting to real server');
+      setConnectionStatus('mock');
+      setIsConnected(true); // Pretend we're connected
+      onOpen?.(); // Call the onOpen callback
+      return;
+    }
+
     // Close existing connection if any
     if (socketRef.current) {
       socketRef.current.close();
@@ -56,7 +75,7 @@ export function useWebSocketConnection({
     
     try {
       setConnectionStatus('connecting');
-      const socket = new WebSocket(url);
+      const socket = new WebSocket(wsUrlRef.current);
       socketRef.current = socket;
       
       socket.binaryType = 'arraybuffer'; // Important for receiving binary audio data
@@ -81,8 +100,11 @@ export function useWebSocketConnection({
           console.log(`Reconnecting (${reconnectCountRef.current}/${maxReconnectAttempts})...`);
           reconnectTimeoutRef.current = window.setTimeout(connect, reconnectInterval);
         } else if (reconnectCountRef.current >= maxReconnectAttempts) {
-          console.error('Max reconnection attempts reached');
-          setConnectionStatus('failed');
+          console.error('Max reconnection attempts reached, switching to mock mode');
+          // Switch to mock mode after max attempts
+          isMockModeRef.current = true;
+          setConnectionStatus('mock');
+          setIsConnected(true); // Pretend we're connected in mock mode
         }
       };
 
@@ -110,12 +132,22 @@ export function useWebSocketConnection({
       };
     } catch (error) {
       console.error('Error establishing WebSocket connection:', error);
-      setConnectionStatus('failed');
+      // Switch to mock mode if connection fails
+      isMockModeRef.current = true;
+      setConnectionStatus('mock');
+      setIsConnected(true); // Pretend we're connected in mock mode
     }
-  }, [url, onOpen, onClose, onError, onMessage, onAudio, autoReconnect, maxReconnectAttempts, reconnectInterval]);
+  }, [wsUrlRef.current, onOpen, onClose, onError, onMessage, onAudio, autoReconnect, maxReconnectAttempts, reconnectInterval]);
 
   // Disconnect from the WebSocket server
   const disconnect = useCallback(() => {
+    if (isMockModeRef.current) {
+      console.log('WebSocket in mock mode - disconnecting mock connection');
+      setConnectionStatus('disconnected');
+      setIsConnected(false);
+      return;
+    }
+
     if (socketRef.current) {
       socketRef.current.close();
       socketRef.current = null;
@@ -131,23 +163,64 @@ export function useWebSocketConnection({
     setConnectionStatus('disconnected');
   }, []);
 
-  // Send a message to the WebSocket server
+  // Send a message to the WebSocket server (or handle mock mode)
   const sendMessage = useCallback((message: WebSocketMessage) => {
+    if (isMockModeRef.current) {
+      console.log('Mock WebSocket - message sent:', message);
+      // Simulate response in mock mode
+      if (message.type === 'start_recording') {
+        setTimeout(() => {
+          onMessage?.({ type: 'info', message: 'Mock recording started' });
+        }, 100);
+      } else if (message.type === 'stop_recording') {
+        setTimeout(() => {
+          onMessage?.({ type: 'info', message: 'Mock recording stopped' });
+        }, 100);
+      }
+      return;
+    }
+
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify(message));
     } else {
       console.error('Cannot send message: WebSocket is not connected');
     }
-  }, []);
+  }, [onMessage]);
 
-  // Send binary data to the WebSocket server
+  // Send binary data to the WebSocket server (or handle mock mode)
   const sendBinaryData = useCallback((data: ArrayBuffer | Blob) => {
+    if (isMockModeRef.current) {
+      console.log('Mock WebSocket - binary data sent:', data instanceof Blob ? data.size : data.byteLength, 'bytes');
+      return;
+    }
+
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       socketRef.current.send(data);
     } else {
       console.error('Cannot send binary data: WebSocket is not connected');
     }
   }, []);
+
+  // Update mock mode if it changes
+  useEffect(() => {
+    if (mockMode !== isMockModeRef.current) {
+      isMockModeRef.current = mockMode;
+      if (mockMode) {
+        // Switch to mock mode
+        if (socketRef.current) {
+          socketRef.current.close();
+          socketRef.current = null;
+        }
+        setConnectionStatus('mock');
+        setIsConnected(true);
+      } else {
+        // Switch back to real mode
+        setConnectionStatus('disconnected');
+        setIsConnected(false);
+        connect();
+      }
+    }
+  }, [mockMode, connect]);
 
   // Connect on mount, disconnect on unmount
   useEffect(() => {
@@ -164,6 +237,7 @@ export function useWebSocketConnection({
     connect,
     disconnect,
     sendMessage,
-    sendBinaryData
+    sendBinaryData,
+    isMockMode: isMockModeRef.current
   };
 } 

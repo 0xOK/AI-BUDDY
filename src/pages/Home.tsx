@@ -9,6 +9,7 @@ import { transcribeAudio } from '@/services/transcription';
 import { generateChatResponse } from '@/services/openai';
 import { generateSpeech as generateElevenLabsSpeech } from '@/services/elevenlabs';
 import { generateSpeech as generateOpenAISpeech } from '@/services/openai';
+import { useConversationEngine } from '@/hooks/useConversationEngine';
 
 // Welcome message from Buddy
 const WELCOME_MESSAGE = "Hi, my name is Buddy, I'm your Binaryx Assistant, how I can help?";
@@ -61,17 +62,28 @@ export function Home() {
   const [recording, setRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [inputText, setInputText] = useState('');
-  const [status, setStatus] = useState<'idle' | 'listening' | 'processing'>('idle');
+  const [status, setStatus] = useState<'idle' | 'listening' | 'processing' | 'error'>('idle');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [welcomeMessageShown, setWelcomeMessageShown] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { playAudio, stopAudio, isPlaying } = useAudioPlayer();
   
-  // For debugging
+  // Add conversation engine hook
+  const {
+    state: conversationState,
+    isProcessing: isConversationProcessing,
+    sendMessage: sendToConversationEngine,
+    interrupt: interruptConversation,
+    resetConversation
+  } = useConversationEngine();
+  
+  // Debug logs
   useEffect(() => {
     console.log('Current messages array:', messages);
-  }, [messages]);
+    console.log('Conversation state:', conversationState);
+  }, [messages, conversationState]);
   
-  // Scroll to top whenever messages change (since newest are at top)
+  // Scroll to top whenever messages change
   const scrollToTop = () => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
@@ -200,8 +212,8 @@ export function Home() {
     }
   }, [checkForRegistrationIntent]);
   
-  // Voice recording functionality
-  const { isRecording, startRecording, stopRecording } = useVoiceStream({
+  // Voice recording functionality with interruption support
+  const { isRecording, startRecording, stopRecording, webSocketStatus } = useVoiceStream({
     onData: async (audioBlob) => {
       console.log('Received audio blob:', audioBlob.size);
       
@@ -209,6 +221,23 @@ export function Home() {
         // Indicate processing state
         setStatus('processing');
         setProcessing(true);
+        setErrorMessage(null);
+        
+        // Check if audio blob is too small (likely no speech)
+        if (audioBlob.size < 5000) {
+          console.warn('Audio blob too small, likely no speech detected');
+          setErrorMessage('I couldn\'t hear anything. Please try speaking louder or check your microphone.');
+          setStatus('error');
+          
+          // Reset after a few seconds
+          setTimeout(() => {
+            setErrorMessage(null);
+            setStatus('idle');
+          }, 3000);
+          
+          setProcessing(false);
+          return;
+        }
         
         // Transcribe the audio
         const transcription = await transcribeAudio(audioBlob);
@@ -216,8 +245,30 @@ export function Home() {
         
         if (!transcription.text || transcription.text.trim() === '') {
           console.warn('No transcription text received or empty text');
+          
+          // Show friendly error message based on the actual error
+          let userMessage = 'I couldn\'t understand what you said. Please try again.';
+          
+          if (transcription.error) {
+            if (transcription.error.includes('silent') || 
+                transcription.error.includes('No speech') || 
+                transcription.error.includes('too short')) {
+              userMessage = 'I didn\'t hear anything. Please speak louder or check your microphone.';
+            } else if (transcription.error.includes('format')) {
+              userMessage = 'There was a technical issue with the audio. Please try again.';
+            }
+          }
+          
+          setErrorMessage(userMessage);
+          setStatus('error');
+          
+          // Reset after a few seconds
+          setTimeout(() => {
+            setErrorMessage(null);
+            setStatus('idle');
+          }, 3000);
+          
           setProcessing(false);
-          setStatus('idle');
           return;
         }
         
@@ -229,43 +280,64 @@ export function Home() {
         const userMessage = await addMessage(userInput, 'user');
         console.log('Added user message:', userMessage);
         
-        // Process the message
-        const response = await processMessage(userInput);
-        console.log('Got response:', response);
+        // Process the message using the conversation engine
+        const response = await sendToConversationEngine(userInput, false);
+        console.log('Got response from conversation engine:', response);
         
         // Add assistant response
-        const assistantMessage = await addMessage(response.assistantResponse, 'assistant');
+        const assistantMessage = await addMessage(response.response, 'assistant');
         console.log('Added assistant message:', assistantMessage);
         
         // Play audio response if available
-        if (response.audio) {
-          await playAudio(response.audio);
+        let audioData: ArrayBuffer | null = null;
+        try {
+          audioData = USE_ELEVEN_LABS
+            ? await generateElevenLabsSpeech(response.response)
+            : await generateOpenAISpeech(response.response);
+            
+          if (audioData) {
+            await playAudio(audioData);
+          }
+        } catch (error) {
+          console.error('Error generating response speech:', error);
         }
         
         // Handle redirect if needed
         if (response.action === 'redirect') {
           // Wait a bit for the audio to be heard before redirecting
           setTimeout(() => {
-            navigate(response.to);
+            navigate(response.to!);
           }, 2000);
         }
       } catch (error) {
         console.error('Error processing voice input:', error);
+        
+        // Show error to user
+        setErrorMessage('An error occurred processing your voice input. Please try again.');
+        setStatus('error');
+        
+        // Reset after a few seconds
+        setTimeout(() => {
+          setErrorMessage(null);
+          setStatus('idle');
+        }, 3000);
       } finally {
-        setRecording(false);
+        // Don't automatically stop recording, just end processing state
         setProcessing(false);
-        setStatus('idle');
+        // Status is already set in success/error handlers
       }
     },
     // Configure voice activity detection
     silenceThreshold: 0.05,    // Increase this value if it stops too early
-    silenceTimeout: 1500       // 1.5 seconds of silence to stop recording
+    silenceTimeout: 1500,      // 1.5 seconds of silence to stop recording
+    autoStopOnSilence: false,  // Disable automatic stopping on silence
+    useMockWebSocket: true     // Use mock WebSocket mode to prevent connection errors
   });
 
   // Handle button press to start/stop recording
   const handleStartRecording = async () => {
+    // If already recording, processing, or playing - stop those activities
     if (recording || processing || isPlaying) {
-      // If recording or processing or playing, stop everything
       if (isPlaying) {
         stopAudio();
       }
@@ -319,14 +391,80 @@ export function Home() {
     }
   };
 
+  // Handle stopping recording and processing
   const handleStopRecording = () => {
-    if (!recording) return;
-    console.log('Handle stop recording called');
-    stopRecording();
+    console.log('Handle stop recording called - will stop all active processes');
+    
+    // Cancel any active requests by interrupting the conversation
+    interruptConversation();
+    console.log('Interrupted any ongoing conversation');
+    
+    // Stop recording
+    if (recording) {
+      console.log('Stopping voice recording');
+      stopRecording();
+      setRecording(false);
+    } else {
+      console.log('No active recording to stop');
+    }
+    
+    // Stop any playing audio
+    if (isPlaying) {
+      console.log('Stopping audio playback');
+      stopAudio();
+    } else {
+      console.log('No audio playing to stop');
+    }
+    
+    // Reset all processing states
+    setProcessing(false);
+    setStatus('idle');
+    setErrorMessage(null);
+    processingMessageRef.current = false;
+    
+    // Force all hooks to update, in case there are any stale states
+    setTimeout(() => {
+      console.log('Reset complete - all processes stopped');
+    }, 100);
+  };
+  
+  // Handle interruptions of ongoing process
+  const handleInterruptProcessing = () => {
+    console.log('Interrupting processing...');
+    
+    // Stop any ongoing audio playback
+    if (isPlaying) {
+      stopAudio();
+    }
+    
+    // Stop recording if active
+    if (recording) {
+      stopRecording();
+      setRecording(false);
+    }
+    
+    // Interrupt the conversation engine
+    interruptConversation();
+    
+    // Reset request processing refs and flags
+    processingMessageRef.current = false;
+    
+    // Update local state
+    setProcessing(false);
+    setStatus('idle');
+    setErrorMessage(null);
+    
+    console.log('All processes interrupted');
   };
 
+  // Add a debug flag to track if we're in a loop prevention state
+  const processingMessageRef = useRef(false);
+
   const handleSendMessage = async () => {
-    if (!inputText.trim() || processing || isPlaying) return;
+    if (!inputText.trim() || processing || isPlaying || processingMessageRef.current) return;
+    
+    // Set our loop prevention flag
+    processingMessageRef.current = true;
     
     // Stop audio playback if playing
     if (isPlaying) {
@@ -342,58 +480,44 @@ export function Home() {
     const userMessage = await addMessage(userText, 'user');
     console.log('Added user text message:', userMessage);
     
-    // Process the message
+    // Process the message with the conversation engine
     setProcessing(true);
-    const response = await processMessage(userText);
-    console.log('Got response for text:', response);
+    setStatus('processing');
+    const response = await sendToConversationEngine(userText, false);
+    console.log('Got response from conversation engine:', response);
     setProcessing(false);
+    setStatus('idle');
     
     // Add assistant response
-    const assistantMessage = await addMessage(response.assistantResponse, 'assistant');
+    const assistantMessage = await addMessage(response.response, 'assistant');
     console.log('Added assistant text response:', assistantMessage);
     
     // Play audio response if available
-    if (response.audio) {
-      await playAudio(response.audio);
+    try {
+      const audioData = USE_ELEVEN_LABS
+        ? await generateElevenLabsSpeech(response.response)
+        : await generateOpenAISpeech(response.response);
+        
+      if (audioData) {
+        await playAudio(audioData);
+      }
+    } catch (error) {
+      console.error('Error generating speech:', error);
     }
     
     // Handle redirect if needed
     if (response.action === 'redirect') {
       // Wait a bit for the audio to be heard before redirecting
       setTimeout(() => {
-        navigate(response.to);
+        navigate(response.to!);
       }, 2000);
     }
+    
+    // Release our loop prevention flag
+    setTimeout(() => {
+      processingMessageRef.current = false;
+    }, 500); // Add a small delay to prevent rapid consecutive triggers
   };
-
-  // Status indicator styles
-  const getStatusColor = () => {
-    switch (status) {
-      case 'listening':
-        return 'bg-green-500';
-      case 'processing':
-        return 'bg-yellow-500';
-      default:
-        return 'bg-gray-300';
-    }
-  };
-
-  // Get status text
-  const getStatusText = () => {
-    switch (status) {
-      case 'idle':
-        return 'Ready to listen';
-      case 'listening':
-        return 'Listening...'; 
-      case 'processing':
-        return 'Processing...';
-      default:
-        return 'Ready';
-    }
-  };
-
-  // Get a copy of messages in reverse chronological order
-  const reversedMessages = [...(messages || [])].reverse();
 
   // Handle clearing session
   const handleClearSession = () => {
@@ -403,6 +527,10 @@ export function Home() {
         stopAudio();
       }
       
+      // Clear the conversation engine state
+      resetConversation();
+      
+      // Clear the session
       clearSession();
       setWelcomeMessageShown(false);
       
@@ -418,6 +546,39 @@ export function Home() {
       }, 100);
     }
   };
+
+  // Status indicator styles
+  const getStatusColor = () => {
+    switch (status) {
+      case 'listening':
+        return 'bg-green-500';
+      case 'processing':
+        return 'bg-yellow-500';
+      case 'error':
+        return 'bg-red-500';
+      default:
+        return 'bg-gray-300';
+    }
+  };
+
+  // Get status text
+  const getStatusText = () => {
+    switch (status) {
+      case 'idle':
+        return 'Ready to listen';
+      case 'listening':
+        return 'Listening...'; 
+      case 'processing':
+        return 'Processing...';
+      case 'error':
+        return errorMessage || 'Error occurred';
+      default:
+        return 'Ready';
+    }
+  };
+
+  // Get a copy of messages in reverse chronological order
+  const reversedMessages = [...(messages || [])].reverse();
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4">
@@ -442,20 +603,19 @@ export function Home() {
             isRecording={recording}
             onStart={handleStartRecording}
             onStop={handleStopRecording}
+            onInterrupt={handleInterruptProcessing}
             isProcessing={processing}
             label="Start Conversation"
           />
           <div className="mt-4 flex items-center">
             <div className={`w-3 h-3 rounded-full ${getStatusColor()} mr-2 animate-pulse`}></div>
             <span className="text-sm">
-              {status === 'idle' ? 'Ready to listen' : 
-               status === 'listening' ? 'Listening...' : 
-               'Processing...'}
+              {getStatusText()}
             </span>
           </div>
         </div>
         
-        {/* Input Area (moved to top for easier access when viewing newest messages first) */}
+        {/* Input Area */}
         <div className="bg-white shadow-md rounded-lg overflow-hidden p-4 flex items-center">
           <input
             type="text"
@@ -463,12 +623,18 @@ export function Home() {
             placeholder="Type a message..."
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+            onKeyDown={(e) => {
+              // Only trigger send on Enter if not processing
+              if (e.key === 'Enter' && !processing && !isPlaying) {
+                e.preventDefault();
+                handleSendMessage();
+              }
+            }}
           />
           <button
             className="btn-primary rounded-l-none"
             onClick={handleSendMessage}
-            disabled={processing}
+            disabled={processing || isPlaying || !inputText.trim()}
           >
             Send
           </button>
@@ -476,7 +642,7 @@ export function Home() {
         
         {/* Chat Interface */}
         <div className="bg-white shadow-md rounded-lg overflow-hidden flex flex-col h-96">
-          {/* Reference for scrolling to the top (newest messages) */}
+          {/* Reference for scrolling */}
           <div ref={messagesEndRef} />
           
           {/* Chat Messages - reversed order (newest first) */}
@@ -497,6 +663,17 @@ export function Home() {
             )}
           </div>
         </div>
+        
+        {/* Conversation Stage Debug Info - Remove in production */}
+        {process.env.NODE_ENV !== 'production' && (
+          <div className="mt-4 p-2 bg-gray-100 text-xs text-gray-500 rounded">
+            <div>Conversation Stage: {conversationState.stage}</div>
+            <div>Turn Count: {conversationState.turnCount}</div>
+            <div>Last Interrupted: {conversationState.lastInterrupted ? 'Yes' : 'No'}</div>
+            <div>History Items: {conversationState.history.length}</div>
+            <div>WebSocket: {webSocketStatus.isMockMode ? 'Mock Mode' : webSocketStatus.status}</div>
+          </div>
+        )}
       </div>
     </div>
   );

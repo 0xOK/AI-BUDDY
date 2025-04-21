@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { generateResponse, ChatResponse } from '../llm/generateResponse';
+import { generateResponse, generateResponseFromPrompt, ChatResponse } from '../llm/generateResponse';
 import { fetchAllScripts, fetchScriptByStage } from '../supabase/fetchScripts';
 
 const openai = new OpenAI({
@@ -32,20 +32,56 @@ export class ConversationEngine {
   private scripts: Script[] = [];
 
   constructor() {
-    this.loadScripts();
+    // Load scripts immediately but don't await
+    this.loadScripts().catch(error => {
+      console.error('Failed to load scripts during initialization:', error);
+      // Already handled in loadScripts by setting empty array
+    });
   }
 
   private async loadScripts() {
     try {
-      this.scripts = await fetchAllScripts();
+      console.log('Loading conversation scripts...');
+      const scripts = await fetchAllScripts();
+      
+      // Ensure we have valid scripts array
+      if (Array.isArray(scripts) && scripts.length > 0) {
+        this.scripts = scripts;
+        console.log(`Loaded ${scripts.length} conversation scripts successfully`);
+      } else {
+        console.warn('No scripts loaded, will use fallbacks');
+        this.scripts = [];
+      }
     } catch (error) {
       console.error('Error loading scripts:', error);
       this.scripts = [];
     }
   }
 
+  // Get a fallback response when scripts aren't available
+  private getFallbackResponse(stage: number): string {
+    const fallbacks = [
+      "Hello! I'm your AI assistant. How can I help you today?",
+      "I see you're interested in our services. Would you like to learn more about our features?",
+      "Great! Would you like to register to get full access to all features?"
+    ];
+    
+    // If stage is out of bounds, return the first one
+    if (stage < 1 || stage > fallbacks.length) {
+      return fallbacks[0];
+    }
+    
+    return fallbacks[stage - 1];
+  }
+
   private getCurrentScript(): Script | null {
-    return this.scripts.find(script => script.stage === this.currentStage) || null;
+    const script = this.scripts.find(script => script.stage === this.currentStage);
+    
+    if (!script) {
+      console.warn(`No script found for stage ${this.currentStage}, using fallback`);
+    }
+    
+    return script || null;
   }
 
   private async advanceStage() {
@@ -70,14 +106,27 @@ export class ConversationEngine {
             text: currentScript.prompt,
             error: undefined,
           };
-          await this.advanceStage();
         } else {
-          // Fallback to LLM if no script is available
-          response = await generateResponse(message.text);
+          // No script available, use fallback
+          response = {
+            text: this.getFallbackResponse(this.currentStage),
+            error: undefined,
+          };
         }
+        
+        // Advance to next stage
+        await this.advanceStage();
       } else {
         // Use LLM for normal conversation
-        response = await generateResponse(message.text);
+        try {
+          response = await generateResponseFromPrompt(message.text);
+        } catch (llmError) {
+          console.error('Error generating LLM response:', llmError);
+          response = {
+            text: "I'm sorry, I'm having trouble processing your request right now. Could you try again?",
+            error: undefined,
+          };
+        }
       }
 
       // Check if response contains a redirect action
